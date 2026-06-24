@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from src.etl.company_mapper import apply_company_mappings, write_mapping_reports
 from src.etl.database import export_schema, foreign_key_check, load_sqlite
 from src.etl.loader import ExcelLoader
 from src.etl.normaliser import normalize_dataset
@@ -36,6 +37,9 @@ def run_pipeline(
 
     loader = ExcelLoader()
     tables = {}
+    mapped_tables = {}
+    mapping_reports = {}
+    replacement_log = pd.DataFrame()
     audit_rows = []
 
     LOGGER.info("Starting full ETL load for %s datasets", len(DATASETS))
@@ -67,15 +71,20 @@ def run_pipeline(
                 )
             )
 
+    if tables:
+        mapped_tables, replacement_log = apply_company_mappings(tables)
+        mapping_reports = write_mapping_reports(tables, mapped_tables)
+
     db_row_counts = {}
     written_schema = None
-    if tables:
-        db_row_counts = load_sqlite(tables, db_path)
+    if mapped_tables:
+        db_row_counts = load_sqlite(mapped_tables, db_path)
         written_schema = export_schema(db_path)
         LOGGER.info("Loaded SQLite database: %s", db_path)
 
-    fk_violations = foreign_key_check(db_path) if tables else []
+    fk_violations = foreign_key_check(db_path) if mapped_tables else []
     fk_counts = _foreign_key_counts_by_table(fk_violations)
+    mapping_counts = _mapping_counts_by_table(replacement_log)
 
     final_audit_rows = []
     for row in audit_rows:
@@ -87,6 +96,7 @@ def run_pipeline(
         db_count = db_row_counts.get(table_name, 0)
         source_count = row["source_row_count"]
         fk_count = fk_counts.get(table_name, 0)
+        mapping_count = mapping_counts.get(table_name, 0)
 
         if source_count != db_count:
             status = "ROW_COUNT_MISMATCH"
@@ -103,6 +113,8 @@ def run_pipeline(
                 "row_count": db_count,
                 "db_row_count": db_count,
                 "fk_violation_count": fk_count,
+                "fk_status": "PASS" if fk_count == 0 else "FAIL",
+                "mapping_replacement_count": mapping_count,
                 "status": status,
                 "message": message,
             }
@@ -110,17 +122,20 @@ def run_pipeline(
         final_audit_rows.append(row)
 
     written_audit = write_load_audit(final_audit_rows, audit_path)
-    written_failures = DataQualityValidator().write_failures(tables, validation_path)
+    written_failures = DataQualityValidator().write_failures(mapped_tables, validation_path)
 
     LOGGER.info("Wrote load audit: %s", written_audit)
     LOGGER.info("Wrote validation failures: %s", written_failures)
 
     return {
-        "tables": tables,
+        "tables": mapped_tables,
+        "raw_tables": tables,
         "db_path": Path(db_path),
         "schema_path": written_schema,
         "audit_path": written_audit,
         "validation_path": written_failures,
+        "mapping_reports": mapping_reports,
+        "replacement_log": replacement_log,
         "foreign_key_violations": fk_violations,
     }
 
@@ -137,6 +152,8 @@ def write_load_audit(rows, audit_path="output/load_audit.csv"):
         "source_row_count",
         "db_row_count",
         "fk_violation_count",
+        "fk_status",
+        "mapping_replacement_count",
         "message",
     ]
 
@@ -171,6 +188,8 @@ def _audit_row(
         "source_row_count": source_row_count,
         "db_row_count": db_row_count,
         "fk_violation_count": 0,
+        "fk_status": "UNKNOWN",
+        "mapping_replacement_count": 0,
         "message": message,
     }
 
@@ -181,6 +200,16 @@ def _foreign_key_counts_by_table(violations):
         table_name = violation["table_name"]
         counts[table_name] = counts.get(table_name, 0) + 1
     return counts
+
+
+def _mapping_counts_by_table(replacement_log):
+    if replacement_log.empty:
+        return {}
+
+    return {
+        table_name: int(group["replacement_count"].sum())
+        for table_name, group in replacement_log.groupby("source_table")
+    }
 
 
 def _configure_logging():
