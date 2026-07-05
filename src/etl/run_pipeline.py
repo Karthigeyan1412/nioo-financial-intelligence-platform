@@ -3,6 +3,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from src.analytics.cashflow import generate_capital_allocation_report
+from src.analytics.financial_ratios_builder import build_financial_ratios_table
 from src.etl.company_mapper import apply_company_mappings, write_mapping_reports
 from src.etl.database import export_schema, foreign_key_check, load_sqlite
 from src.etl.loader import ExcelLoader
@@ -74,12 +76,14 @@ def run_pipeline(
     if tables:
         mapped_tables, replacement_log = apply_company_mappings(tables)
         mapping_reports = write_mapping_reports(tables, mapped_tables)
+        mapped_tables["financial_ratios"] = build_financial_ratios_table(mapped_tables)
 
     db_row_counts = {}
     written_schema = None
     if mapped_tables:
         db_row_counts = load_sqlite(mapped_tables, db_path)
         written_schema = export_schema(db_path)
+        generate_capital_allocation_report(db_path)
         LOGGER.info("Loaded SQLite database: %s", db_path)
 
     fk_violations = foreign_key_check(db_path) if mapped_tables else []

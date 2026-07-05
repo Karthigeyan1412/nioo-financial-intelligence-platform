@@ -75,8 +75,15 @@ CREATE TABLE "financial_ratios" (
     "earnings_per_share" REAL,
     "book_value_per_share" REAL,
     "dividend_payout_ratio_pct" REAL,
-    "total_debt_cr" INTEGER,
+    "total_debt_cr" REAL,
     "cash_from_operations_cr" REAL,
+    "revenue_cagr_5yr" REAL,
+    "pat_cagr_5yr" REAL,
+    "eps_cagr_5yr" REAL,
+    "composite_quality_score" REAL,
+    "revenue_cagr_5yr_flag" TEXT,
+    "pat_cagr_5yr_flag" TEXT,
+    "eps_cagr_5yr_flag" TEXT,
     FOREIGN KEY ("company_id") REFERENCES "companies" ("company_id")
 );
 
