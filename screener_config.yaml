@@ -1,0 +1,52 @@
+metrics:
+  roe_min:
+    column: return_on_equity_pct
+    operator: min
+  debt_to_equity_max:
+    column: debt_to_equity
+    operator: max
+  free_cash_flow_min:
+    column: free_cash_flow_cr
+    operator: min
+  revenue_cagr_5yr_min:
+    column: revenue_cagr_5yr
+    operator: min
+  revenue_cagr_3yr_min:
+    column: revenue_cagr_3yr
+    operator: min
+  pat_cagr_5yr_min:
+    column: pat_cagr_5yr
+    operator: min
+  operating_profit_margin_min:
+    column: operating_profit_margin_pct
+    operator: min
+  pe_max:
+    column: pe_ratio
+    operator: max
+  pb_max:
+    column: pb_ratio
+    operator: max
+  dividend_yield_min:
+    column: dividend_yield_pct
+    operator: min
+  dividend_payout_max:
+    column: dividend_payout_ratio_pct
+    operator: max
+  interest_coverage_min:
+    column: interest_coverage
+    operator: min
+  market_cap_min:
+    column: market_cap_crore
+    operator: min
+  net_profit_min:
+    column: net_profit
+    operator: min
+  eps_cagr_min:
+    column: eps_cagr_5yr
+    operator: min
+  asset_turnover_min:
+    column: asset_turnover
+    operator: min
+  sales_min:
+    column: sales
+    operator: min
