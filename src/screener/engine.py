@@ -1,6 +1,8 @@
 from pathlib import Path
 import sqlite3
 
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill
 import pandas as pd
 import yaml
 
@@ -9,6 +11,51 @@ from src.analytics.cagr import calculate_metric_cagrs
 
 DEFAULT_CONFIG_PATH = "screener_config.yaml"
 FINANCIAL_SECTOR = "FINANCIALS"
+GREEN_FILL = "C6EFCE"
+RED_FILL = "FFC7CE"
+
+
+SCORING_METRICS = [
+    ("return_on_equity_pct", 0.15, True),
+    ("return_on_capital_employed_pct", 0.10, True),
+    ("net_profit_margin_pct", 0.10, True),
+    ("fcf_cagr_5yr", 0.15, True),
+    ("cfo_pat_ratio", 0.10, True),
+    ("positive_free_cash_flow_flag", 0.05, True),
+    ("revenue_cagr_5yr", 0.10, True),
+    ("pat_cagr_5yr", 0.10, True),
+    ("debt_to_equity", 0.10, False),
+    ("interest_coverage", 0.05, True),
+]
+
+EXPORT_COLUMNS = [
+    ("company_name", "Company"),
+    ("company_id", "Company ID"),
+    ("broad_sector", "Sector"),
+    ("year", "Year"),
+    ("return_on_equity_pct", "ROE"),
+    ("return_on_capital_employed_pct", "ROCE"),
+    ("net_profit_margin_pct", "Net Profit Margin"),
+    ("operating_profit_margin_pct", "Operating Profit Margin"),
+    ("revenue_cagr_5yr", "Revenue CAGR"),
+    ("pat_cagr_5yr", "PAT CAGR"),
+    ("eps_cagr_5yr", "EPS CAGR"),
+    ("debt_to_equity", "Debt-to-Equity"),
+    ("interest_coverage", "Interest Coverage"),
+    ("free_cash_flow_cr", "Free Cash Flow"),
+    ("fcf_cagr_5yr", "FCF CAGR"),
+    ("cfo_pat_ratio", "CFO/PAT Ratio"),
+    ("pe_ratio", "P/E"),
+    ("pb_ratio", "P/B"),
+    ("dividend_yield_pct", "Dividend Yield"),
+    ("dividend_payout_ratio_pct", "Dividend Payout"),
+    ("market_cap_crore", "Market Cap"),
+    ("sales", "Sales"),
+    ("net_profit", "Net Profit"),
+    ("asset_turnover", "Asset Turnover"),
+    ("composite_quality_score", "Composite Quality Score"),
+    ("sector_relative_score", "Sector Relative Score"),
+]
 
 
 PRESETS = {
@@ -115,8 +162,12 @@ def load_screener_dataset(db_path="db/nifty100.db"):
         ratios = pd.read_sql_query("SELECT * FROM financial_ratios", connection)
         market_cap = pd.read_sql_query("SELECT * FROM market_cap", connection)
         profitandloss = pd.read_sql_query("SELECT * FROM profitandloss", connection)
+        cashflow = pd.read_sql_query("SELECT * FROM cashflow", connection)
         sectors = pd.read_sql_query("SELECT company_id, broad_sector FROM sectors", connection)
-        companies = pd.read_sql_query("SELECT company_id, company_name FROM companies", connection)
+        companies = pd.read_sql_query(
+            "SELECT company_id, company_name, roce_percentage FROM companies",
+            connection,
+        )
 
     dataset = ratios.merge(
         market_cap[
@@ -137,10 +188,25 @@ def load_screener_dataset(db_path="db/nifty100.db"):
         on=["company_id", "year"],
         how="left",
     )
+    dataset = dataset.merge(
+        cashflow[["company_id", "year", "operating_activity", "investing_activity"]],
+        on=["company_id", "year"],
+        how="left",
+    )
     dataset = dataset.merge(sectors, on="company_id", how="left")
     dataset = dataset.merge(companies, on="company_id", how="left")
+    dataset["return_on_capital_employed_pct"] = pd.to_numeric(
+        dataset.get("return_on_capital_employed_pct", dataset["roce_percentage"]),
+        errors="coerce",
+    )
+    dataset["cfo_pat_ratio"] = _cfo_pat_ratio(dataset)
+    dataset["positive_free_cash_flow_flag"] = (
+        pd.to_numeric(dataset["free_cash_flow_cr"], errors="coerce") > 0
+    ).astype(int)
     dataset = add_revenue_cagr_3yr(dataset, profitandloss)
+    dataset = add_fcf_cagr_5yr(dataset, cashflow)
     dataset = add_debt_to_equity_declining(dataset)
+    dataset = calculate_composite_scores(dataset)
     return dataset
 
 
@@ -229,8 +295,222 @@ def add_debt_to_equity_declining(df):
 
 
 def ensure_composite_quality_score(df):
-    if "composite_quality_score" in df.columns:
-        return df
+    return calculate_composite_scores(df)
+
+
+def calculate_composite_scores(df):
+    result = df.copy()
+    result["positive_free_cash_flow_flag"] = (
+        pd.to_numeric(result.get("free_cash_flow_cr", 0), errors="coerce") > 0
+    ).astype(int)
+
+    global_scores = _weighted_scores(result)
+    result["composite_quality_score"] = global_scores.clip(0, 100)
+
+    if "broad_sector" not in result.columns:
+        result["sector_relative_score"] = result["composite_quality_score"]
+        return result
+
+    sector_scores = pd.Series(index=result.index, dtype="float64")
+    for _, sector_df in result.groupby(result["broad_sector"].fillna("UNKNOWN")):
+        sector_scores.loc[sector_df.index] = _weighted_scores(sector_df).to_numpy(dtype="float64")
+
+    result["sector_relative_score"] = sector_scores.fillna(0).clip(0, 100)
+    return result
+
+
+def winsorize_series(values):
+    values = pd.to_numeric(values, errors="coerce").replace([float("inf"), -float("inf")], pd.NA)
+    if values.dropna().empty:
+        return values
+
+    p10 = values.quantile(0.10)
+    p90 = values.quantile(0.90)
+    return values.clip(lower=p10, upper=p90)
+
+
+def scale_metric(values, higher_is_better=True):
+    winsorized = winsorize_series(values)
+    if winsorized.dropna().empty:
+        return pd.Series(0, index=values.index, dtype="float64")
+
+    min_value = winsorized.min()
+    max_value = winsorized.max()
+    if pd.isna(min_value) or pd.isna(max_value) or min_value == max_value:
+        return winsorized.notna().astype(float) * 50
+
+    scaled = ((winsorized - min_value) / (max_value - min_value)) * 100
+    if not higher_is_better:
+        scaled = 100 - scaled
+
+    return scaled.fillna(0).clip(0, 100).astype("float64")
+
+
+def add_fcf_cagr_5yr(df, cashflow):
+    result = df.copy()
+    if "fcf_cagr_5yr" not in result.columns:
+        result["fcf_cagr_5yr"] = pd.NA
+
+    cashflow = cashflow.copy()
+    cashflow["free_cash_flow_cr"] = (
+        pd.to_numeric(cashflow["operating_activity"], errors="coerce")
+        + pd.to_numeric(cashflow["investing_activity"], errors="coerce")
+    )
+
+    cagr_lookup = {}
+    for company_id, group in cashflow.groupby("company_id"):
+        records = group.sort_values("year").to_dict("records")
+        for _, row in group.iterrows():
+            year = row["year"]
+            historical_records = [
+                record
+                for record in records
+                if record.get("year") is not None and record["year"] <= year
+            ]
+            cagr = calculate_metric_cagrs(
+                historical_records,
+                "free_cash_flow_cr",
+                "fcf",
+                periods=(5,),
+            )
+            cagr_lookup[(company_id, year)] = cagr["fcf_cagr_5yr"]
+
+    result["fcf_cagr_5yr"] = result.apply(
+        lambda row: cagr_lookup.get((row.get("company_id"), row.get("year")), row.get("fcf_cagr_5yr")),
+        axis=1,
+    )
+    return result
+
+
+def export_preset_screeners_to_excel(
+    db_path="db/nifty100.db",
+    output_path="output/screener_output.xlsx",
+):
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    data = load_screener_dataset(db_path)
+    preset_functions = {
+        "Quality Compounder": run_quality_compounder,
+        "Value Pick": run_value_pick,
+        "Growth Accelerator": run_growth_accelerator,
+        "Dividend Champion": run_dividend_champion,
+        "Debt-Free Blue Chip": run_debt_free_blue_chip,
+        "Turnaround Watch": run_turnaround_watch,
+    }
+
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        for sheet_name, preset_function in preset_functions.items():
+            result = preset_function(data).sort_values(
+                "composite_quality_score",
+                ascending=False,
+                na_position="last",
+            )
+            export_df = _export_columns(result)
+            export_df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+    _apply_conditional_formatting(output_path)
+    return output_path
+
+
+def _weighted_scores(df):
+    total = pd.Series(0.0, index=df.index)
+    for column, weight, higher_is_better in SCORING_METRICS:
+        if column == "interest_coverage" and column in df.columns:
+            values = _effective_interest_coverage(df)
+        elif column in df.columns:
+            values = pd.to_numeric(df[column], errors="coerce")
+        else:
+            values = pd.Series(pd.NA, index=df.index)
+
+        total += scale_metric(values, higher_is_better).astype("float64") * weight
+
+    return total.astype("float64").clip(0, 100)
+
+
+def _cfo_pat_ratio(df):
+    cfo = pd.to_numeric(df.get("operating_activity"), errors="coerce")
+    pat = pd.to_numeric(df.get("net_profit"), errors="coerce")
+    return cfo / pat.mask(pat == 0)
+
+
+def _export_columns(df):
+    output = pd.DataFrame()
+    for source_column, display_column in EXPORT_COLUMNS:
+        output[display_column] = df[source_column] if source_column in df.columns else pd.NA
+    return output
+
+
+def _apply_conditional_formatting(output_path):
+    workbook = load_workbook(output_path)
+    green = PatternFill(start_color=GREEN_FILL, end_color=GREEN_FILL, fill_type="solid")
+    red = PatternFill(start_color=RED_FILL, end_color=RED_FILL, fill_type="solid")
+    rules_by_sheet = {
+        "Quality Compounder": {
+            "ROE": (">", 15),
+            "Debt-to-Equity": ("<", 1),
+            "Free Cash Flow": (">", 0),
+            "Revenue CAGR": (">", 10),
+        },
+        "Value Pick": {
+            "P/E": ("<", 20),
+            "P/B": ("<", 3),
+            "Debt-to-Equity": ("<", 2),
+            "Dividend Yield": (">", 1),
+        },
+        "Growth Accelerator": {
+            "PAT CAGR": (">", 20),
+            "Revenue CAGR": (">", 15),
+            "Debt-to-Equity": ("<", 2),
+        },
+        "Dividend Champion": {
+            "Dividend Yield": (">", 2),
+            "Dividend Payout": ("<", 80),
+            "Free Cash Flow": (">", 0),
+        },
+        "Debt-Free Blue Chip": {
+            "Debt-to-Equity": ("=", 0),
+            "ROE": (">", 12),
+            "Sales": (">", 5000),
+        },
+        "Turnaround Watch": {
+            "Revenue CAGR": (">", 10),
+            "Free Cash Flow": (">", 0),
+        },
+    }
+
+    for sheet_name, rules in rules_by_sheet.items():
+        worksheet = workbook[sheet_name]
+        headers = {cell.value: cell.column for cell in worksheet[1]}
+        for header, rule in rules.items():
+            if header not in headers:
+                continue
+            column_index = headers[header]
+            for row in range(2, worksheet.max_row + 1):
+                cell = worksheet.cell(row=row, column=column_index)
+                cell.fill = green if _cell_satisfies(cell.value, rule) else red
+
+    workbook.save(output_path)
+
+
+def _cell_satisfies(value, rule):
+    operator, threshold = rule
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return False
+
+    if operator == ">":
+        return value > threshold
+    if operator == "<":
+        return value < threshold
+    if operator == "=":
+        return value == threshold
+    return False
+
+
+def _legacy_composite_quality_score(df):
+    """Kept for reference during migration to weighted Day 17 scoring."""
 
     metric_columns = [
         "return_on_equity_pct",
